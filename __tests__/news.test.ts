@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { GET } from "@/app/api/news/route";
 
 const MOCK_API_KEY = "test-newsdata-key";
+const MOCK_OPENWEATHER_KEY = "test-openweather-key";
 
 /**
  * Payload de Newsdata.io para noticias nacionales. Incluye artículos sin
@@ -39,7 +40,7 @@ const nacionalPayload = {
   ],
 };
 
-/** Payload de Newsdata.io para la región local de Coquimbo. */
+/** Payload de Newsdata.io para la región local del usuario. */
 const localPayload = {
   status: "success",
   totalResults: 1,
@@ -55,16 +56,36 @@ const localPayload = {
   ],
 };
 
+const GEO_URL_PART = "api.openweathermap.org/geo/1.0/reverse";
+
 /**
- * Crea un mock de `fetch` que responde según la URL consultada: si incluye
- * `q=coquimbo` devuelve el payload local; en caso contrario, el nacional.
+ * Crea un mock de `fetch` con orquestación realista:
+ * - A la URL de geocodificación inversa de OpenWeather responde la ciudad
+ *   "La Serena".
+ * - A las URLs de Newsdata.io responde según tengan o no término `q=`.
+ *
+ * Normaliza el argumento `url` a texto, ya que el Route Handler pasa un
+ * objeto `URL` en la llamada de geocodificación y un `string` en Newsdata.
  */
-function createFetchMock() {
+function createFetchMock({
+  geoOk = true,
+  geoPayload = [{ name: "La Serena" }],
+}: { geoOk?: boolean; geoPayload?: unknown } = {}) {
   const fetchMock = vi.fn(
-    async (url: string, _init?: RequestInit) => {
-      const isLocal = url.includes("q=coquimbo");
-      const payload = isLocal ? localPayload : nacionalPayload;
-      return { ok: true, json: async () => payload };
+    async (input: RequestInfo | URL, _init?: RequestInit) => {
+      const url = String(input);
+
+      if (url.includes(GEO_URL_PART)) {
+        return geoOk
+          ? { ok: true, json: async () => geoPayload }
+          : { ok: false, json: async () => ({}) };
+      }
+
+      if (url.includes("q=")) {
+        return { ok: true, json: async () => localPayload };
+      }
+
+      return { ok: true, json: async () => nacionalPayload };
     },
   );
   vi.stubGlobal("fetch", fetchMock);
@@ -73,15 +94,17 @@ function createFetchMock() {
 
 beforeEach(() => {
   process.env.NEWSDATA_API_KEY = MOCK_API_KEY;
+  process.env.OPENWEATHER_API_KEY = MOCK_OPENWEATHER_KEY;
 });
 
 afterEach(() => {
   vi.unstubAllGlobals();
   delete process.env.NEWSDATA_API_KEY;
+  delete process.env.OPENWEATHER_API_KEY;
 });
 
 describe("GET /api/news", () => {
-  it("filtro nacional: consulta Chile sin query local y mapea al DTO", async () => {
+  it("filtro nacional: consulta Chile sin geocodificación ni query local", async () => {
     const fetchMock = createFetchMock();
 
     const response = await GET(
@@ -91,7 +114,7 @@ describe("GET /api/news", () => {
     expect(fetchMock).toHaveBeenCalledTimes(1);
     const [url, options] = fetchMock.mock.calls[0];
     expect(url).toContain("country=cl");
-    expect(url).not.toContain("q=coquimbo");
+    expect(url).not.toContain("q=");
     expect(options).toEqual({ next: { revalidate: 900 } });
 
     expect(response.status).toBe(200);
@@ -127,17 +150,27 @@ describe("GET /api/news", () => {
     });
   });
 
-  it("filtro local: consulta Chile con q=coquimbo", async () => {
+  it("filtro local: hace geocodificación inversa y usa la ciudad en q=", async () => {
     const fetchMock = createFetchMock();
 
     const response = await GET(
-      new Request("http://localhost/api/news?filter=local"),
+      new Request("http://localhost/api/news?filter=local&lat=-29.95&lon=-71.33"),
     );
 
-    expect(fetchMock).toHaveBeenCalledTimes(1);
-    const [url] = fetchMock.mock.calls[0];
-    expect(url).toContain("country=cl");
-    expect(url).toContain("q=coquimbo");
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+
+    const [geoUrl] = fetchMock.mock.calls[0];
+    expect(geoUrl).toContain(GEO_URL_PART);
+    expect(geoUrl).toContain("lat=-29.95");
+    expect(geoUrl).toContain("lon=-71.33");
+    expect(geoUrl).toContain("limit=1");
+    expect(geoUrl).toContain(`appid=${MOCK_OPENWEATHER_KEY}`);
+
+    const [newsUrl, options] = fetchMock.mock.calls[1];
+    expect(newsUrl).toContain("country=cl");
+    expect(newsUrl).toContain("q=");
+    expect(newsUrl).not.toContain("q=coquimbo");
+    expect(options).toEqual({ next: { revalidate: 900 } });
 
     expect(response.status).toBe(200);
     const articles = (await response.json()) as Array<Record<string, unknown>>;
@@ -153,17 +186,47 @@ describe("GET /api/news", () => {
     });
   });
 
-  it("filtro ambas: combina los arreglos nacional y local con Promise.all", async () => {
+  it("filtro local sin lat/lon: cae al fallback genérico (coquimbo) sin geocodificar", async () => {
     const fetchMock = createFetchMock();
 
     const response = await GET(
-      new Request("http://localhost/api/news?filter=ambas"),
+      new Request("http://localhost/api/news?filter=local"),
+    );
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const [url] = fetchMock.mock.calls[0];
+    expect(url).toContain("q=coquimbo");
+
+    expect(response.status).toBe(200);
+  });
+
+  it("filtro local con geocodificación fallida: usa el fallback coquimbo", async () => {
+    const fetchMock = createFetchMock({ geoOk: false });
+
+    const response = await GET(
+      new Request("http://localhost/api/news?filter=local&lat=-29.95&lon=-71.33"),
     );
 
     expect(fetchMock).toHaveBeenCalledTimes(2);
-    const [nacionalUrl, localUrl] = fetchMock.mock.calls.map(([url]) => url);
-    expect(nacionalUrl).not.toContain("q=coquimbo");
-    expect(localUrl).toContain("q=coquimbo");
+    const [newsUrl] = fetchMock.mock.calls[1].map((arg) => String(arg));
+    expect(newsUrl).toContain("q=coquimbo");
+
+    expect(response.status).toBe(200);
+  });
+
+  it("filtro ambas: geocodifica una vez y combina los arreglos con Promise.all", async () => {
+    const fetchMock = createFetchMock();
+
+    const response = await GET(
+      new Request("http://localhost/api/news?filter=ambas&lat=-29.95&lon=-71.33"),
+    );
+
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+
+    const urls = fetchMock.mock.calls.map(([url]) => url);
+    expect(urls[0]).toContain(GEO_URL_PART);
+    expect(urls[1]).not.toContain("q=");
+    expect(urls[2]).toContain("q=");
 
     expect(response.status).toBe(200);
     const articles = (await response.json()) as Array<Record<string, unknown>>;
@@ -182,6 +245,7 @@ describe("GET /api/news", () => {
 
     const response = await GET(new Request("http://localhost/api/news"));
 
+    // Sin lat/lon la geolocalización se omite: solo nacional + local.
     expect(fetchMock).toHaveBeenCalledTimes(2);
     expect(response.status).toBe(200);
   });

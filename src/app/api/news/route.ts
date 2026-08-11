@@ -24,8 +24,8 @@ interface NewsdataResponse {
   }>;
 }
 
-/** Región local por defecto (regla de negocio del módulo). */
-const LOCAL_REGION = "coquimbo";
+/** Región local genérica usada solo si la geolocalización falla. */
+const FALLBACK_LOCAL_REGION = "coquimbo";
 
 /**
  * Estrategia de caché acordada: 15 minutos (900 segundos) entre peticiones a
@@ -33,17 +33,21 @@ const LOCAL_REGION = "coquimbo";
  */
 const REVALIDATE_SECONDS = 900;
 
+const NEWS_BASE_URL = "https://newsdata.io/api/1/news";
+const OPEN_WEATHER_GEO_URL = "https://api.openweathermap.org/geo/1.0/reverse";
+
 /**
  * Construye la URL de Newsdata.io para un filtro dado. La llave se lee desde
- * `process.env` (servidor) y nunca viaja al bundle del cliente.
+ * `process.env` (servidor) y nunca viaja al bundle del cliente. `query` es el
+ * término opcional de búsqueda (ciudad dinámica para noticias locales).
  */
-function buildNewsUrl(apiKey: string, filter: NewsFilter): string {
-  const url = new URL("https://newsdata.io/api/1/news");
+function buildNewsUrl(apiKey: string, query?: string): string {
+  const url = new URL(NEWS_BASE_URL);
   url.searchParams.set("apikey", apiKey);
   url.searchParams.set("country", "cl");
 
-  if (filter === "local") {
-    url.searchParams.set("q", LOCAL_REGION);
+  if (query) {
+    url.searchParams.set("q", query);
   }
 
   return url.toString();
@@ -110,6 +114,71 @@ function parseFilter(value: string | null): NewsFilter {
   return "ambas";
 }
 
+function parseCoordinate(value: string | null): number | null {
+  if (value === null) return null;
+
+  const coordinate = Number(value);
+  return Number.isFinite(coordinate) ? coordinate : null;
+}
+
+/**
+ * Ejecuta un fetch contra Newsdata.io con la URL dada y valida la respuesta en
+ * runtime. Si la API no está disponible o devuelve un payload inválido,
+ * lanza un error que el Route Handler convierte en un 503 controlado.
+ */
+async function fetchNews(apiKey: string, url: string): Promise<NewsdataResponse> {
+  const response = await fetch(url, { next: { revalidate: REVALIDATE_SECONDS } });
+
+  if (!response.ok) {
+    throw new Error("Newsdata.io no está disponible en este momento.");
+  }
+
+  const payload: unknown = await response.json();
+  if (!isNewsdataResponse(payload)) {
+    throw new Error("La respuesta de Newsdata.io no tiene el formato esperado.");
+  }
+
+  return payload;
+}
+
+/**
+ * Geocodificación inversa: traduce unas coordenadas a un nombre de ciudad
+ * usando la API de OpenWeather (`/geo/1.0/reverse`). Se envuelve en try/catch
+ * por resiliencia: si falla (red, llave ausente o respuesta inválida) devuelve
+ * `null` y el Route Handler cae al `FALLBACK_LOCAL_REGION`.
+ */
+async function reverseGeocodeCity(
+  lat: number | null,
+  lon: number | null,
+): Promise<string | null> {
+  if (lat === null || lon === null) return null;
+
+  const apiKey = process.env.OPENWEATHER_API_KEY;
+  if (!apiKey) return null;
+
+  try {
+    const url = new URL(OPEN_WEATHER_GEO_URL);
+    url.searchParams.set("lat", String(lat));
+    url.searchParams.set("lon", String(lon));
+    url.searchParams.set("limit", "1");
+    url.searchParams.set("appid", apiKey);
+
+    const response = await fetch(url.toString());
+    if (!response.ok) return null;
+
+    const payload: unknown = await response.json();
+    if (!Array.isArray(payload) || payload.length === 0) return null;
+
+    const [place] = payload;
+    if (!isRecord(place) || typeof place.name !== "string") return null;
+
+    const city = place.name.trim();
+    return city.length > 0 ? city : null;
+  } catch {
+    return null;
+  }
+}
+
 /**
  * Backend for Frontend del módulo de Noticias.
  *
@@ -118,13 +187,18 @@ function parseFilter(value: string | null): NewsFilter {
  * (15 minutos) y devolviendo únicamente un arreglo limpio de `NewsArticleDTO`.
  *
  * - `?filter=nacional`: consume la API apuntando a Chile (newsdata.io).
- * - `?filter=local`: consume la API con `q=coquimbo` (región local por defecto).
- * - `?filter=ambas` (o ausente/inválido): ejecuta ambos fetch en paralelo con
- *   `Promise.all` y combina los arreglos.
+ * - `?filter=local&lat&lon`: primero resuelve la ciudad real del usuario con
+ *   geocodificación inversa de OpenWeather y usa ese texto en `q=...`.
+ * - `?filter=ambas&lat&lon`: hace la geocodificación, luego ejecuta ambos
+ *   fetch (nacional y local) en paralelo con `Promise.all` y los combina.
+ *
+ * Si la geolocalización falla, se usa `FALLBACK_LOCAL_REGION` (Coquimbo).
  */
 export async function GET(request: Request) {
   const searchParams = new URL(request.url).searchParams;
   const filter = parseFilter(searchParams.get("filter"));
+  const lat = parseCoordinate(searchParams.get("lat"));
+  const lon = parseCoordinate(searchParams.get("lon"));
 
   const apiKey = process.env.NEWSDATA_API_KEY;
   if (!apiKey) {
@@ -137,54 +211,24 @@ export async function GET(request: Request) {
   try {
     let articles: NewsArticleDTO[];
 
-    if (filter === "nacional" || filter === "local") {
-      const url = buildNewsUrl(apiKey, filter);
-      const response = await fetch(url, { next: { revalidate: REVALIDATE_SECONDS } });
-      if (!response.ok) {
-        return NextResponse.json(
-          { error: "Newsdata.io no está disponible en este momento." },
-          { status: 503 },
-        );
-      }
-      const payload: unknown = await response.json();
-      if (!isNewsdataResponse(payload)) {
-        return NextResponse.json(
-          { error: "La respuesta de Newsdata.io no tiene el formato esperado." },
-          { status: 503 },
-        );
-      }
+    if (filter === "nacional") {
+      const payload = await fetchNews(apiKey, buildNewsUrl(apiKey));
       articles = mapResults(payload);
     } else {
-      const [nacionalUrl, localUrl] = [
-        buildNewsUrl(apiKey, "nacional"),
-        buildNewsUrl(apiKey, "local"),
-      ];
+      const city = await reverseGeocodeCity(lat, lon);
+      const query = city ?? FALLBACK_LOCAL_REGION;
 
-      const [nacionalResponse, localResponse] = await Promise.all([
-        fetch(nacionalUrl, { next: { revalidate: REVALIDATE_SECONDS } }),
-        fetch(localUrl, { next: { revalidate: REVALIDATE_SECONDS } }),
-      ]);
+      if (filter === "local") {
+        const payload = await fetchNews(apiKey, buildNewsUrl(apiKey, query));
+        articles = mapResults(payload);
+      } else {
+        const [nacionalPayload, localPayload] = await Promise.all([
+          fetchNews(apiKey, buildNewsUrl(apiKey)),
+          fetchNews(apiKey, buildNewsUrl(apiKey, query)),
+        ]);
 
-      if (!nacionalResponse.ok || !localResponse.ok) {
-        return NextResponse.json(
-          { error: "Newsdata.io no está disponible en este momento." },
-          { status: 503 },
-        );
+        articles = [...mapResults(nacionalPayload), ...mapResults(localPayload)];
       }
-
-      const [nacionalPayload, localPayload] = (await Promise.all([
-        nacionalResponse.json(),
-        localResponse.json(),
-      ])) as [unknown, unknown];
-
-      if (!isNewsdataResponse(nacionalPayload) || !isNewsdataResponse(localPayload)) {
-        return NextResponse.json(
-          { error: "La respuesta de Newsdata.io no tiene el formato esperado." },
-          { status: 503 },
-        );
-      }
-
-      articles = [...mapResults(nacionalPayload), ...mapResults(localPayload)];
     }
 
     return NextResponse.json(articles);

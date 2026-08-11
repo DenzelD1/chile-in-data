@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { usePathname, useRouter, useSearchParams } from "next/navigation";
 
 import type { NewsArticleDTO } from "@/types/news";
@@ -16,6 +16,8 @@ const FILTERS: ReadonlyArray<{ value: NewsFilter; label: string }> = [
 
 const NEWS_UNAVAILABLE_MESSAGE =
   "Las noticias no están disponibles en este momento. Inténtalo más tarde.";
+const LOCATION_REQUIRED_MESSAGE =
+  "Se requiere ubicación para noticias locales.";
 
 function parseFilter(value: string | null): NewsFilter {
   if (value === "nacional" || value === "local") return value;
@@ -26,11 +28,14 @@ function parseFilter(value: string | null): NewsFilter {
  * Widget de noticias nacionales y regionales de Chile. Es un Client Component:
  * - Usa `useSearchParams`, `usePathname` y `useRouter` de `next/navigation`
  *   para mantener el estado del filtro en la URL (`?newsFilter=<valor>`).
+ * - Pide la ubicación al navegador al montarse (`navigator.geolocation`).
  * - Consume el Route Handler propio (`/api/news`) — nunca Newsdata.io en el
  *   cliente, para proteger la llave.
  *
- * Regla de negocio crítica: si Newsdata.io falla, el widget captura el error y
- * muestra un mensaje amigable en lugar de tumbar la aplicación.
+ * Regla de negocio crítica: si el filtro pide noticias locales (Local o
+ * Ambas) y el usuario deniega la ubicación, el widget NO llama a la API y
+ * muestra "Se requiere ubicación para noticias locales" en lugar de fabricar
+ * una región por defecto.
  */
 export function NewsWidget() {
   const searchParams = useSearchParams();
@@ -42,16 +47,80 @@ export function NewsWidget() {
   const [articles, setArticles] = useState<NewsArticleDTO[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [coords, setCoords] = useState<{ lat: number; lon: number } | null>(
+    null,
+  );
+  const [locationDenied, setLocationDenied] = useState(false);
+  const locationRequestedRef = useRef(false);
+
+  const needsLocation = currentFilter === "local" || currentFilter === "ambas";
+
+  // Geolocalización: solo se pide cuando el filtro requiere noticias locales,
+  // y solo una vez (evita el doble disparo bajo el StrictMode de desarrollo).
+  useEffect(() => {
+    if (!needsLocation) return;
+    if (coords !== null || locationDenied) return;
+    if (locationRequestedRef.current) return;
+    locationRequestedRef.current = true;
+
+    if (!("geolocation" in navigator)) {
+      // Grupo sin soporte de geolocalización. El setState se difiere a un
+      // microtask porque la regla react-hooks desaconseja setState síncrono
+      // dentro del cuerpo del effect.
+      queueMicrotask(() => {
+        setLocationDenied(true);
+      });
+      return;
+    }
+
+    navigator.geolocation.getCurrentPosition(
+      ({ coords: geo }) => {
+        setCoords({ lat: geo.latitude, lon: geo.longitude });
+      },
+      () => {
+        setLocationDenied(true);
+      },
+      { enableHighAccuracy: false, timeout: 10_000, maximumAge: 300_000 },
+    );
+  }, [needsLocation, coords, locationDenied]);
 
   useEffect(() => {
     let cancelled = false;
 
+    // Ubicación exigida y denegada: fallback amigable, NO se llama a la API.
+    if (needsLocation && locationDenied) {
+      queueMicrotask(() => {
+        if (cancelled) return;
+        setArticles([]);
+        setLoading(false);
+        setError(LOCATION_REQUIRED_MESSAGE);
+      });
+      return;
+    }
+
+    // Ubicación exigida pero aún en espera de la respuesta del navegador:
+    // se mantiene el skeleton de carga hasta que se resuelva.
+    if (needsLocation && coords === null) {
+      queueMicrotask(() => {
+        if (cancelled) return;
+        setLoading(true);
+        setError(null);
+      });
+      return;
+    }
+
     async function loadNews() {
+      const params = new URLSearchParams({ filter: currentFilter });
+      if (coords !== null) {
+        params.set("lat", String(coords.lat));
+        params.set("lon", String(coords.lon));
+      }
+
       setLoading(true);
       setError(null);
 
       try {
-        const response = await fetch(`/api/news?filter=${currentFilter}`);
+        const response = await fetch(`/api/news?${params.toString()}`);
         if (!response.ok) {
           if (!cancelled) {
             setLoading(false);
@@ -78,7 +147,7 @@ export function NewsWidget() {
     return () => {
       cancelled = true;
     };
-  }, [currentFilter]);
+  }, [currentFilter, needsLocation, coords, locationDenied]);
 
   function updateFilter(filter: NewsFilter) {
     const params = new URLSearchParams(searchParams.toString());
