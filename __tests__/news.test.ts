@@ -240,6 +240,49 @@ describe("GET /api/news", () => {
     ]);
   });
 
+  it("filtro ambas: deduplica artículos repetidos entre nacional y local", async () => {
+    // El artículo a1 existe en el payload nacional y también en el local.
+    const dupLocalPayload = {
+      status: "success",
+      totalResults: 1,
+      results: [
+        {
+          article_id: "a1",
+          title: "Cifra de exportaciones sube en Chile",
+          link: "https://example.com/a1",
+        },
+      ],
+    };
+
+    const fetchMock = vi.fn(
+      async (input: RequestInfo | URL, _init?: RequestInit) => {
+        const url = String(input);
+        if (url.includes(GEO_URL_PART)) {
+          return { ok: true, json: async () => [{ name: "La Serena" }] };
+        }
+        if (url.includes("q=")) {
+          return { ok: true, json: async () => dupLocalPayload };
+        }
+        return { ok: true, json: async () => nacionalPayload };
+      },
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const response = await GET(
+      new Request("http://localhost/api/news?filter=ambas&lat=-29.95&lon=-71.33"),
+    );
+
+    expect(response.status).toBe(200);
+    const articles = (await response.json()) as Array<Record<string, unknown>>;
+
+    expect(articles).toHaveLength(3);
+    expect(articles.map((article) => article.id)).toEqual([
+      "a1",
+      "https://example.com/a3",
+      "Artículo sin enlace ni fuente",
+    ]);
+  });
+
   it("sin parámetro filter usa ambas por defecto", async () => {
     const fetchMock = createFetchMock();
 

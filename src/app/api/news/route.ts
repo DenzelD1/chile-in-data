@@ -227,7 +227,16 @@ export async function GET(request: Request) {
           fetchNews(apiKey, buildNewsUrl(apiKey, query)),
         ]);
 
-        articles = [...mapResults(nacionalPayload), ...mapResults(localPayload)];
+        // El mismo artículo puede aparecer en ambos arreglos; se deduplica por
+        // `id` preservando la primera ocurrencia para que el widget no reciba
+        // claves repetidas.
+        const combined = [
+          ...mapResults(nacionalPayload),
+          ...mapResults(localPayload),
+        ];
+        articles = Array.from(
+          new Map(combined.map((article) => [article.id, article])).values(),
+        );
       }
     }
 

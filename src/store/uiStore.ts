@@ -6,6 +6,11 @@ import { WIDGETS } from "@/lib/widgets";
 import type { WidgetId } from "@/types/widget";
 
 /**
+ * Cantidad de eventos próximos mostrados en el widget de Eventos.
+ */
+export type EventsCount = 1 | 2 | 3;
+
+/**
  * Preferencias de UI que se persisten en `localStorage`.
  */
 interface UiPreferences {
@@ -13,6 +18,8 @@ interface UiPreferences {
   darkMode: boolean;
   /** Filtro de widgets visibles en el dashboard. */
   visibleWidgetIds: WidgetId[];
+  /** Cantidad de eventos próximos a mostrar (1 o 3). */
+  eventsCount: EventsCount;
 }
 
 /**
@@ -25,6 +32,7 @@ interface UiActions {
   hideWidget: (widgetId: WidgetId) => void;
   toggleWidgetVisibility: (widgetId: WidgetId) => void;
   resetWidgetVisibility: () => void;
+  setEventsCount: (count: EventsCount) => void;
 }
 
 type UiState = UiPreferences & UiActions;
@@ -34,6 +42,7 @@ const ALL_WIDGET_IDS: readonly WidgetId[] = WIDGETS.map((widget) => widget.id);
 const initialState: UiPreferences = {
   darkMode: false,
   visibleWidgetIds: [...ALL_WIDGET_IDS],
+  eventsCount: 3,
 };
 
 /**
@@ -74,6 +83,8 @@ export const useUiStore = create<UiState>()(
         })),
 
       resetWidgetVisibility: () => set({ visibleWidgetIds: [...ALL_WIDGET_IDS] }),
+
+      setEventsCount: (count) => set({ eventsCount: count }),
     }),
     {
       name: UI_STORE_STORAGE_KEY,
@@ -81,6 +92,7 @@ export const useUiStore = create<UiState>()(
       partialize: (state) => ({
         darkMode: state.darkMode,
         visibleWidgetIds: state.visibleWidgetIds,
+        eventsCount: state.eventsCount,
       }),
     },
   ),
