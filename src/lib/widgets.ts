@@ -19,7 +19,7 @@ export const WIDGETS: readonly WidgetDefinition[] = [
   {
     id: "population",
     label: "Población",
-    description: "Datos totales y regionales de la población, segmentados por género.",
+    description: "Proyecciones de datos poblacionales según año actual y posteriores.",
     href: "/poblacion",
   },
   {

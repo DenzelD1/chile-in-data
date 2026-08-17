@@ -17,8 +17,7 @@ export default function ClimaPage() {
       <section className="mx-auto flex w-full max-w-6xl flex-1 flex-col gap-4 px-8 py-8">
         <WeatherWidget />
         <p className="text-sm text-zinc-500 dark:text-zinc-400">
-          Este widget consumirá el clima actual y el pronóstico de los próximos
-          días desde la API de OpenWeather.
+          Este widget consume datos actuales de OpenWeather.
         </p>
       </section>
     </main>
